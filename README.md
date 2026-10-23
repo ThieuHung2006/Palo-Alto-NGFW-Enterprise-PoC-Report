@@ -1,411 +1,270 @@
-# Enterprise Multi-Zone Security Architecture, Dual-ISP BGP/OSPF Dynamic Routing Redundancy, and Perimeter Defense Engineering on Palo Alto Networks NGFW (PAN-OS)
+# Proof of Concept (PoC) Report: Enterprise Edge Firewall, Dual-ISP BGP/OSPF Routing and Perimeter Defense on Palo Alto PA-VM
 
-**Author:** Network & Information Security Engineer / Blue Team Specialist  
-**Platform:** Palo Alto Networks PA-VM (PAN-OS 10.1.0) on EVE-NG Emulation Platform  
-**Target Audience:** Technical Hiring Managers, Senior Network Architects, Lead Security Engineers (SOC / Blue Team)
-
----
+**Author:** Thiều Đình Hưng  
+**Platform:** Palo Alto Networks PA-VM (PAN-OS 10.1.0), Cisco IOL, EVE-NG  
+**Type:** Simulated Lab / Proof of Concept (Not a production deployment)  
 
 ## Executive Summary
+This PoC validates an enterprise edge design built around a single Palo Alto PA-VM firewall:
+1. Collapsed-core (2-tier) campus (Core + Access) running OSPFv2 toward the firewall.
+2. Dual-homed WAN edge with eBGP to two simulated ISPs, with primary/backup path selection and automatic failback.
+3. Route-aware NAT: source NAT rules selected by egress interface, plus destination NAT to publish a DMZ web server.
+4. Zone-based security policy using App-ID and least-privilege rules between Trust, DMZ, and Untrust.
+5. Zone Protection against reconnaissance (TCP port scan) and SYN flood, tested from a Kali Linux attacker node.
 
-This document presents a comprehensive Proof of Concept (PoC) validating an enterprise-grade perimeter network architecture deployed on a **Palo Alto Networks Next-Generation Firewall (PA-VM, PAN-OS 10.1.0)**. The design integrates:
-1. **Hierarchical 3-Tier Enterprise Networking** (Core, Distribution/Aggregation, Access) with intra-domain **OSPFv2**.
-2. **Dual-Homed WAN Edge Routing** utilizing **eBGP** with dual Internet Service Providers (ISP1 & ISP2), implementing sub-second failover and automatic failback capabilities.
-3. **Adaptive Network Address Translation (NAT/PAT)** that automatically tracks routing table convergence.
-4. **Zero Trust Inter-Zone Micro-segmentation** leveraging application-level visibility (App-ID) and strict least-privilege security policies.
-5. **Hardware-Level Perimeter Security (Zone Protection)** mitigating high-speed reconnaissance (TCP Port Scans) and state-table exhaustion attacks (TCP SYN Flood) at the firewall ingress stage before session allocation.
-
----
-
-## 1. Enterprise Architecture Overview
-
-The topology simulates a high-availability enterprise environment connecting three isolated security zones (`Untrust`, `DMZ`, and `Trust`) across dynamic routing boundaries.
-
-![Figure 29: End-to-End Enterprise Network Architecture Topology on EVE-NG](./images/29_eve_ng_enterprise_network_topology.png)
-*Markdown Embed Code:* `![Figure 29 - Enterprise Network Topology](./images/29_eve_ng_enterprise_network_topology.png)`
-
-### Key Architectural Highlights for Technical Recruiters:
-* **Zero Trust Security Zone Segmentation:** The firewall (`PaloAlto1`) acts as the single point of policy enforcement, partitioning traffic into `Untrust` (Dual-ISP WAN edge), `DMZ` (publicly exposed servers in `10.10.100.0/24` on `VLAN 100`), and `Trust` (internal corporate departments).
-* **Dual-Homed WAN Edge Redundancy:** Interface `eth1/1` (`198.51.100.0/30`) peers with `ISP-R1` (Autonomous System `AS 65001`), while `eth1/2` (`198.51.200.0/30`) peers with `ISP-R2` (`AS 65002`). The two carrier routers are interconnected over `203.0.113.0/30`. A dedicated `Attacker` node (Kali Linux) is stationed at `e0/2` of `ISP-R1` to conduct realistic red-team penetration tests.
-* **Resilient Core & Access Fabric:** Downstream connectivity links the firewall to dual multilayer core switches (`Core-SW1` via `eth1/4` `10.0.0.0/30` and `Core-SW2` via `eth1/5` `10.0.1.0/30`). A redundant cross-connect (`10.0.2.0/30` across `e0/2`–`e0/3`) prevents split-brain scenarios, aggregating downstream traffic across four access switches (`SW-Access1` through `SW-Access4`) serving `VLAN 10 (IT)` (`10.10.10.0/24`), `VLAN 20 (HR)` (`10.10.20.0/24`), and `VLAN 30 (Server)` (`10.10.30.0/24`).
-* **Isolated DMZ Perimeter:** Interface `eth1/3` (`10.10.100.254`) bridges to `SW_DMZ`, hosting critical infrastructure including `Web_Server` (`10.10.100.10`) and `DNS_Server` (`10.10.100.20`), ensuring zero unrestricted traffic traversal between external clients and internal hosts.
+*All results below come from lab testing. Where a figure or number is a measurement, it is stated as such; limitations are listed in Section 9.*
 
 ---
 
-## 2. Interface Provisioning & Object-Oriented Design
+## 1. Architecture Overview
 
-### 2.1. Layer 3 Interfaces and Security Zone Binding
+![Figure 1 - End-to-end lab topology on EVE-NG](./images/29_eve_ng_enterprise_network_topology.png)
 
-![Figure 05: Layer 3 Interface Addressing, Virtual Router Binding, and Security Zone Mapping](./images/05_paloalto_network_interfaces_ip_zones.png)
-*Markdown Embed Code:* `![Figure 05 - Layer 3 Interfaces and Zones](./images/05_paloalto_network_interfaces_ip_zones.png)`
-
-#### Engineering Insights:
-* All five operational physical interfaces (`ethernet1/1` through `ethernet1/5`) are configured in **Layer 3** mode under a unified global routing entity (`Virtual Router: default`), bound to the management profile `ALLOW-PING` for diagnostics.
-* Dual upstream WAN interfaces (`ethernet1/1` with IP `198.51.100.2/30` and `ethernet1/2` with IP `198.51.200.2/30`) are mapped to the single **`Untrust`** zone. This design pattern simplifies rule evaluation and allows seamless multi-WAN failover without rewriting inter-zone policy headers.
-* Interface `ethernet1/3` (`10.10.100.254/24`) serves as the default gateway for the `DMZ` zone, while `ethernet1/4` (`10.0.0.1/30`) and `ethernet1/5` (`10.0.1.1/30`) provide Point-to-Point routed uplinks to internal core switches within the `Trust` zone. `ethernet1/6` is assigned as a `Tap` interface for passive out-of-band monitoring.
+* Firewall (`PaloAlto1`) enforces policy between three zones: `Untrust` (dual-ISP edge), `DMZ` (10.10.100.0/24, VLAN 100), and `Trust` (internal campus).
+* **Dual-ISP edge:** `eth1/1` (198.51.100.0/30) peers with ISP-R1 (AS 65001); `eth1/2` (198.51.200.0/30) peers with ISP-R2 (AS 65002). The ISP routers are linked by 203.0.113.0/30 and each hosts a loopback as a simulated Internet target (8.8.8.8 on ISP-R1, 1.1.1.1 on ISP-R2). A Kali Linux Attacker node attaches to ISP-R1 `e0/2`.
+* **Campus (collapsed core, 2-tier):** Core-SW1 and Core-SW2 perform both core and distribution roles (SVIs, HSRP gateways, routing), with an LACP EtherChannel between them. Each core connects to the firewall over a routed /30 (`eth1/4` 10.0.0.0/30, `eth1/5` 10.0.1.0/30). Four access switches (SW-Access1..4) uplink to both cores and serve VLAN 10 (IT, 10.10.10.0/24), VLAN 20 (HR, 10.10.20.0/24), and VLAN 30 (Server, 10.10.30.0/24).
+* **DMZ:** `eth1/3` (10.10.100.254/24) connects to SW_DMZ, hosting Web_Server (10.10.100.10) and DNS_Server (10.10.100.20).
+* **Design choice:** A collapsed core was chosen because the campus is small; a separate distribution layer would add devices and configuration without adding value at this scale.
 
 ---
 
-### 2.2. Address Object Hierarchy and Pre-NAT / Post-NAT Structuring
+## 2. Interface Provisioning and Address Objects
 
-![Figure 16: Centralized Address Objects Inventory Defining Network Subnets and Hosts](./images/16_paloalto_objects_addresses_inventory.png)
-*Markdown Embed Code:* `![Figure 16 - Address Objects Inventory](./images/16_paloalto_objects_addresses_inventory.png)`
+### 2.1 Layer 3 Interfaces and Zones
 
-#### Engineering Insights:
-* Adhering to the principle of **Object-Oriented Configuration**, hardcoded IP addresses are strictly avoided. Network subnets are abstracted into named objects: `NET-DMZ` (`10.10.100.0/24`), `NET-HR` (`10.10.20.0/24`), `NET-IT` (`10.10.10.0/24`), and `NET-SRV` (`10.10.30.0/24`).
-* Host definitions for the Web Server strictly decouple the real internal IP (`WEB-DMZ`: `10.10.100.10/32`) from the publicly routed Virtual IP (`WEB-PUBLIC`: `192.0.2.10/32`). This explicit separation is essential for constructing PAN-OS Destination NAT (DNAT) policies, where security enforcement occurs after route evaluation but before packet egress.
+![Figure 2 - Layer 3 interfaces, virtual router binding and zone mapping](./images/05_paloalto_network_interfaces_ip_zones.png)
 
----
+* `ethernet1/1` to `ethernet1/5` are Layer 3 interfaces in virtual router `default`, with management profile `ALLOW-PING` for diagnostics.
+* Both WAN interfaces (198.51.100.2/30, 198.51.200.2/30) belong to one `Untrust` zone, so a single set of inter-zone rules covers both ISPs.
+* `ethernet1/3` is the DMZ gateway; `ethernet1/4` and `ethernet1/5` are routed point-to-point uplinks to the cores, both in `Trust`.
+* A loopback interface in `Untrust` carries the simulated public addresses (192.0.2.1, 192.0.2.10/32).
 
-## 3. Interior Dynamic Routing (OSPFv2) & Route Redistribution
+### 2.2 Address Objects
 
-### 3.1. Point-to-Point OSPF Interface Optimization & Metric Engineering
+![Figure 3 - Address object inventory](./images/16_paloalto_objects_addresses_inventory.png)
 
-![Figure 01: OSPF Area 0.0.0.0 Interface Properties on Trust Uplinks (P2P Link Type)](./images/01_paloalto_ospf_interfaces_p2p_trust.png)
-*Markdown Embed Code:* `![Figure 01 - OSPF Point-to-Point Interfaces](./images/01_paloalto_ospf_interfaces_p2p_trust.png)`
-
-#### Engineering Insights:
-* Uplink interfaces `ethernet1/4` and `ethernet1/5` within backbone `Area ID: 0.0.0.0` are configured with **`Link Type: p2p` (Point-to-Point)**. This bypasses the traditional Designated Router/Backup Designated Router (DR/BDR) election process on broadcast media, eliminating 40 seconds of election latency during link convergence.
-* Asymmetric path cost engineering is deployed: `ethernet1/4` is assigned `Metric: 10` (Primary path via Core-SW1), whereas `ethernet1/5` is assigned `Metric: 20` (Standby path via Core-SW2). Timers are calibrated for rapid dead-link identification: `Hello Interval: 10`, `Dead Counts: 4`, `Retransmit Intervals: 5`, and `Transit Delay: 1`.
+* Networks are defined as objects: `NET-IT`, `NET-HR`, `NET-SRV`, `NET-DMZ`.
+* The web server is split into the real address `WEB-DMZ` (10.10.100.10/32) and the public virtual IP `WEB-PUBLIC` (192.0.2.10/32). This separation is what the destination NAT and the security rules rely on.
 
 ---
 
-### 3.2. Routing Plane Hardening via OSPF Passive Interface on DMZ
+## 3. Interior Routing (OSPFv2) and Redistribution
 
-![Figure 02: OSPF Passive Interface Configuration on DMZ Link (ethernet1/3)](./images/02_paloalto_ospf_passive_interface_dmz.png)
-*Markdown Embed Code:* `![Figure 02 - OSPF Passive Interface DMZ](./images/02_paloalto_ospf_passive_interface_dmz.png)`
+### 3.1 Point-to-Point Interfaces and Path Cost
 
-#### Engineering Insights:
-* Interface `ethernet1/3` (serving the DMZ segment) is flagged as **`Passive`** within the OSPF area.
-* **Security Rationale:** Activating passive mode ensures the firewall advertises the DMZ subnet (`10.10.100.0/24`) to downstream enterprise switches without transmitting OSPF Hello multicasts into the DMZ. This eliminates the risk of rogue OSPF neighbor formation or route poisoning attacks originating from a compromised DMZ host.
+![Figure 4 - OSPF Area 0 interfaces on the Trust uplinks](./images/01_paloalto_ospf_interfaces_p2p_trust.png)
 
----
+* `ethernet1/4` and `ethernet1/5` are in Area 0.0.0.0 with link type `p2p`, which avoids DR/BDR election on these two-node links.
+* Cost is 10 on `ethernet1/4` (preferred, via Core-SW1) and 20 on `ethernet1/5` (backup, via Core-SW2), ensuring return traffic prefers the same core that is HSRP active.
 
-### 3.3. Redistribution Profile Filtering: BGP Default Route Injection
+### 3.2 Passive Interface on the DMZ
 
-![Figure 03: Redistribution Profile RP-BGP-DEF Matching Inbound BGP Default Route](./images/03_paloalto_redistribution_profile_bgp_default.png)
-*Markdown Embed Code:* `![Figure 03 - Redistribution Profile BGP Default Route](./images/03_paloalto_redistribution_profile_bgp_default.png)`
+![Figure 5 - OSPF passive interface on ethernet1/3](./images/02_paloalto_ospf_passive_interface_dmz.png)
 
-#### Engineering Insights:
-* Redistribution profile `RP-BGP-DEF` (`Priority: 1`) is configured to match dynamic routes where `Source Type: bgp` and destination matches strictly `Destination: 0.0.0.0/0`.
-* This selective filter prevents dynamic Internet prefixes learned from upstream transit providers from flooding the internal OSPF domain, protecting the finite memory of internal switches while propagating outbound routing reachability.
+* `ethernet1/3` is passive: the DMZ subnet is advertised to the cores, but no OSPF hellos are sent into the DMZ, ensuring a compromised DMZ host cannot form an OSPF adjacency with the firewall.
 
----
+### 3.3 Injecting the BGP Default Route into OSPF
 
-### 3.4. OSPF Export Rule: External Type 2 Propagation
+![Figure 6 - Redistribution profile RP-BGP-DEF](./images/03_paloalto_redistribution_profile_bgp_default.png)  
+![Figure 7 - OSPF export rule, path type ext-2](./images/04_paloalto_ospf_export_rules_redistribute_bgp.png)
 
-![Figure 04: OSPF Export Rule Injecting BGP Default Route as External Type 2](./images/04_paloalto_ospf_export_rules_redistribute_bgp.png)
-*Markdown Embed Code:* `![Figure 04 - OSPF Export Rules Redistribute BGP](./images/04_paloalto_ospf_export_rules_redistribute_bgp.png)`
+* Profile `RP-BGP-DEF` (priority 1) matches source type `bgp` and destination `0.0.0.0/0` only.
+* It is exported into OSPF as External Type 2 (`ext-2`), ensuring only the default route reaches the cores and Internet prefixes stay out of the OSPF database.
 
-#### Engineering Insights:
-* The Virtual Router (`Router ID: 10.255.255.1`) exports `RP-BGP-DEF` into the internal OSPF topology as **`PATH TYPE: ext-2` (External Type 2)**. This maintains a predictable cost across internal routing hops.
-* Inbound protection is enforced via `Reject Default Route` on the OSPF process, ensuring the firewall never accepts a downstream default route that could induce routing loops.
+### 3.4 Adjacency Verification
+
+![Figure 8 - OSPF neighbors in Full state](./images/06_paloalto_ospf_neighbors_state_full.png)
+
+* The firewall shows full adjacency in Area 0.0.0.0 with 10.0.0.2 (Router ID 10.255.255.2, Core-SW1) and 10.0.1.2 (Router ID 10.255.255.3, Core-SW2).
 
 ---
 
-### 3.5. OSPF Runtime Adjacency Verification
+## 4. Exterior Routing: Dual-ISP eBGP
 
-![Figure 06: Runtime OSPF Neighbor Table Confirming FULL Adjacency with Dual Core Routers](./images/06_paloalto_ospf_neighbors_state_full.png)
-*Markdown Embed Code:* `![Figure 06 - OSPF Neighbors Full State](./images/06_paloalto_ospf_neighbors_state_full.png)`
+### 4.1 Global BGP Parameters
 
-#### Engineering Insights:
-* The operational state confirms `STATUS: full` within `AREA ID: 0.0.0.0` across both core distribution switches: `10.0.0.2` (`NEIGHBOR ROUTER ID: 10.255.255.2`, `Remaining Lifetime: 39s`) and `10.0.1.2` (`NEIGHBOR ROUTER ID: 10.255.255.3`, `Remaining Lifetime: 33s`).
-* With `MESSAGES PENDING: 0`, the Link State Database (LSDB) is fully synchronized across the control plane.
+![Figure 9 - BGP general settings](./images/11_paloalto_bgp_general_settings.png)
 
----
+* Local AS 65000, Router ID 10.255.255.1, `Install Route` enabled.
+* `Reject Default Route` is unchecked so the firewall accepts the default route originated by each ISP. Default local preference is 100.
 
-## 4. Exterior Dynamic Routing: Dual-ISP eBGP & Traffic Engineering
+### 4.2 Peer Groups and Peers
 
-### 4.1. Global BGP Autonomous System Parameters
+![Figure 10 - BGP peer groups](./images/09_paloalto_bgp_peer_groups_summary.png)  
+![Figure 11 - Peer ISP1-R1 (AS 65001)](./images/13_paloalto_bgp_peer_details_isp1.png)  
+![Figure 12 - Peer ISP2-R2 (AS 65002)](./images/14_paloalto_bgp_peer_details_isp2.png)
 
-![Figure 11: Global BGP Virtual Router Parameters (AS 65000, Router ID 10.255.255.1)](./images/11_paloalto_bgp_general_settings.png)
-*Markdown Embed Code:* `![Figure 11 - BGP General Settings](./images/11_paloalto_bgp_general_settings.png)`
+* Two eBGP peer groups are established (one per ISP) so each ISP can have an independent import/export policy.
+* Both peers have `Max Prefixes 5000` to protect the control plane against route leaks.
 
-#### Engineering Insights:
-* The enterprise firewall operates under private Autonomous System **`AS Number: 65000`**, with `Router ID: 10.255.255.1` and `Install Route` enabled to push selected BGP best paths from the Loc-RIB into the Forwarding Information Base (FIB).
-* Crucially, `Reject Default Route` is intentionally **unchecked**, permitting the firewall to accept `0.0.0.0/0` advertisements from upstream providers. `Default Local Preference` is set to `100`, and `Deterministic MED comparison` is enabled to enforce RFC-compliant path selection across peers.
+### 4.3 Path Selection and Export Filtering
 
----
+![Figure 13 - Import rule ISP1-IN](./images/08_paloalto_bgp_import_rules_isp1.png)  
+![Figure 14 - Export rules](./images/07_paloalto_bgp_export_rules_public_prefix.png)
 
-### 4.2. Upstream eBGP Peer Groups Definition
+* **Outbound path selection:** Import rule `ISP1-IN` raises local preference for routes learned from ISP1, establishing ISP1 as the preferred exit and ISP2 as the backup.
+* **Anti-transit export policy:** An allow rule permits only the public host route to be advertised, followed by `DENY-ALL` / `DENY-ALL2`. This stops the firewall from re-advertising routes learned from one ISP to the other (becoming a transit AS) and prevents leaking RFC 1918 prefixes.
 
-![Figure 09: BGP Peer Groups Overview for Carrier Interconnections (ISP1 & ISP2)](./images/09_paloalto_bgp_peer_groups_summary.png)
-*Markdown Embed Code:* `![Figure 09 - BGP Peer Groups Summary](./images/09_paloalto_bgp_peer_groups_summary.png)`
+**Verification:**  
+Executing `show ip bgp 8.8.8.8` on ISP-R2 confirms the filter operates correctly, showing only the direct ISP-to-ISP path with no AS 65000 in the transit path:
+```text
+ISP-R2# show ip bgp 8.8.8.8
+BGP routing table entry for 8.8.8.8/32, version 4
+Paths: (1 available, best #1, table default)
+  Not advertised to any peer
+  Refresh Epoch 1
+  65001
+    203.0.113.1 from 203.0.113.1 (198.51.100.1)
+      Origin IGP, metric 0, localpref 100, valid, external, best
+```
 
-#### Engineering Insights:
-* To maintain isolated control-plane policies, the firewall establishes two distinct `ebgp` peer groups:
-  * `ISP1`: Peering with `ISP1-R1` (`198.51.100.1`) via local interface `198.51.100.2/30`.
-  * `ISP2`: Peering with `ISP2-R2` (`198.51.200.1`) via local interface `198.51.200.2/30`.
+### 4.4 Public Prefix Advertisement
 
----
+![Figure 15 - BGP redistribution rules summary](./images/10_paloalto_bgp_redistribute_rules_summary.png)  
+![Figure 16 - Redistribution rule for the web host route 192.0.2.10/32](./images/12_paloalto_bgp_redistribute_rule_web_ip.png)
 
-### 4.3. Detailed eBGP Peer Configuration: Primary & Secondary Paths
+* The web VIP is advertised as a host route `192.0.2.10/32`. On PAN-OS, a loopback address is inherently installed as a /32.
 
-![Figure 13: eBGP Peer Details for ISP1-R1 (Peer AS 65001, Max Prefixes 5000)](./images/13_paloalto_bgp_peer_details_isp1.png)
-*Markdown Embed Code:* `![Figure 13 - BGP Peer Details ISP1](./images/13_paloalto_bgp_peer_details_isp1.png)`
+### 4.5 Session State
 
-![Figure 14: eBGP Peer Details for ISP2-R2 (Peer AS 65002, Max Prefixes 5000)](./images/14_paloalto_bgp_peer_details_isp2.png)
-*Markdown Embed Code:* `![Figure 14 - BGP Peer Details ISP2](./images/14_paloalto_bgp_peer_details_isp2.png)`
+![Figure 17 - BGP peers in Established state](./images/15_paloalto_bgp_peers_state_established.png)
 
-#### Engineering Insights:
-* `ISP1-R1` belongs to transit provider `AS 65001`, configured as the primary gateway, while `ISP2-R2` belongs to `AS 65002` as the secondary failover path.
-* **Control Plane Defense:** Both peers enforce **`MAX PREFIXES: 5000`**. This setting guards the firewall’s control plane against routing table exhaustion caused by upstream BGP misconfigurations or route leaks. Export and Import next-hop resolution is enforced through `Next Hop: Resolve`.
-
----
-
-### 4.4. Inbound & Outbound Policy Filtering (Preventing AS Transit & Route Leaks)
-
-![Figure 08: BGP Import Rules for ISP1 (ISP1-IN)](./images/08_paloalto_bgp_import_rules_isp1.png)
-*Markdown Embed Code:* `![Figure 08 - BGP Import Rules ISP1](./images/08_paloalto_bgp_import_rules_isp1.png)`
-
-![Figure 07: BGP Export Rules Enforcing Public Prefix Whitelisting and Explicit Deny-All](./images/07_paloalto_bgp_export_rules_public_prefix.png)
-*Markdown Embed Code:* `![Figure 07 - BGP Export Rules Public Prefix](./images/07_paloalto_bgp_export_rules_public_prefix.png)`
-
-#### Engineering Insights:
-* **Inbound Traffic Steering:** Rule `ISP1-IN` assigns higher attributes (e.g., elevated Local Preference) to default routes learned from ISP1, designating ISP1 as the preferred egress path under steady-state conditions.
-* **Outbound Whitelisting (Anti-Transit AS Architecture):** The export policy applies a strict white-list model: rule `ALLOW-PUBLIC` permits only the enterprise public block `192.0.2.0/24(exact)` to be advertised externally (`ACTION: allow`). Immediately below, `DENY-ALL` and `DENY-ALL2` drop all other route advertisements (`ACTION: deny`). This guarantees internal RFC 1918 prefixes are never leaked and prevents the enterprise from inadvertently operating as a transit network between ISP1 and ISP2.
+* Both sessions (198.51.100.1 and 198.51.200.1) are currently `Established`.
 
 ---
 
-### 4.5. Enterprise Public Service Prefix Redistribution
+## 5. NAT and Security Policy
 
-![Figure 10: BGP Redistribution Rules Summary for Public Service Subnets](./images/10_paloalto_bgp_redistribute_rules_summary.png)
-*Markdown Embed Code:* `![Figure 10 - BGP Redistribution Rules Summary](./images/10_paloalto_bgp_redistribute_rules_summary.png)`
+### 5.1 NAT Policy
 
-![Figure 12: Detailed Redistribution Rule Injecting Web VIP 192.0.2.10/32 into BGP](./images/12_paloalto_bgp_redistribute_rule_web_ip.png)
-*Markdown Embed Code:* `![Figure 12 - BGP Redistribute Rule Web IP](./images/12_paloalto_bgp_redistribute_rule_web_ip.png)`
+![Figure 18 - NAT policy (DNAT and per-ISP SNAT)](./images/18_paloalto_nat_policy_dnat_snat_rules.png)  
+![Figure 19 - NAT rule hit counts with ISP1 active](./images/26_paloalto_nat_policy_hit_count_isp1_active.png)
 
-![Figure 17: Redistribution Rule Injecting Enterprise Public IP Block 192.0.2.0/24 into BGP](./images/17_paloalto_bgp_redistribute_rule_public_subnet.png)
-*Markdown Embed Code:* `![Figure 17 - BGP Redistribute Rule Public Subnet](./images/17_paloalto_bgp_redistribute_rule_public_subnet.png)`
+* **DNAT (`DNAT-Web-80`):** Source and destination zones are both `Untrust` in the Original Packet, matching the pre-NAT destination (`WEB-PUBLIC`). The destination is translated (Static IP) to `WEB-DMZ` on port 80, and the post-NAT route lookup places the packet in the `DMZ`.
+* **SNAT (`SNAT-via-ISP1`, `SNAT-via-ISP2`):** Utilizes Dynamic IP and Port using the egress interface address. The rules are separated by Destination Interface (`ethernet1/1` / `ethernet1/2`), guaranteeing the correct public address is applied dynamically based on active routing.
+* With ISP1 active, `SNAT-via-ISP1` registers 34 hits while `SNAT-via-ISP2` registers 0.
 
-#### Engineering Insights:
-* To ensure public web services hosted in the DMZ remain reachable over both ISP connections, host routes (`192.0.2.10/32`) and the aggregated enterprise public block (`192.0.2.0/24`) are redistributed into the BGP Loc-RIB with `Set Origin: incomplete`. This setup provides resilient ingress path options across the upstream providers.
+### 5.2 Security Policy
 
----
+![Figure 20 - Security policy ruleset](./images/19_paloalto_security_policy_ruleset.png)
 
-### 4.6. eBGP Adjacency Convergence State
+1. `IT-to-DMZ-Admin`: `NET-IT` (Trust) to `NET-DMZ`, applications `ping`, `ssh`, `ssl`, `web-browsing`, service `application-default`.
+2. `HR-to-DMZ-Web` & `HR-to-DMZ-Deny`: HR may use `dns`, `ssl`, `web-browsing` toward the DMZ; everything else from HR to the DMZ is explicitly denied.
+3. `Trust-to-Internet`: Outbound access for approved applications.
+4. `Internet-to-Web`: Destination address is the pre-NAT `WEB-PUBLIC`, destination zone is the post-NAT zone `DMZ`; only `web-browsing` and `ssl` are allowed.
+5. `DMZ-to-Trust-Deny`: Blocks connections initiated from the DMZ toward the internal network, mitigating lateral movement from a compromised server.
+6. `Cleanup`: Explicit deny with active logging.
 
-![Figure 15: BGP Peer Status Confirming Dual ESTABLISHED State across ISP1 and ISP2](./images/15_paloalto_bgp_peers_state_established.png)
-*Markdown Embed Code:* `![Figure 15 - BGP Peers State Established](./images/15_paloalto_bgp_peers_state_established.png)`
+### 5.3 Security Profiles
 
-#### Engineering Insights:
-* The runtime BGP peer monitor verifies that both external peering sessions (`ISP1-R1` on `198.51.100.1` and `ISP2-R2` on `198.51.200.1`) have completed the TCP port 179 handshake and transitioned into **`STATUS: Established`**, demonstrating a synchronized exterior routing control plane.
+![Figure 21 - Security profile group SPG-Strict](./images/20_paloalto_security_profile_groups_strict.png)  
+![Figure 22 - Vulnerability Protection profile (strict)](./images/image_c96219.png)  
+![Figure 23 - Profile group and log settings bound to security rules](./images/image_c962b2.png)
 
----
-
-## 5. Security Architecture: Adaptive NAT & Zero Trust Policies
-
-### 5.1. Route-Adaptive Multi-ISP Source NAT & Inbound Destination NAT
-
-![Figure 18: Complete NAT Policy Configuration (Inbound DNAT and Multi-ISP SNAT)](./images/18_paloalto_nat_policy_dnat_snat_rules.png)
-*Markdown Embed Code:* `![Figure 18 - NAT Policy Configuration](./images/18_paloalto_nat_policy_dnat_snat_rules.png)`
-
-![Figure 26: NAT Rule Hit Count Statistics Validating Primary SNAT Path Allocation](./images/26_paloalto_nat_policy_hit_count_isp1_active.png)
-*Markdown Embed Code:* `![Figure 26 - NAT Policy Hit Counts](./images/26_paloalto_nat_policy_hit_count_isp1_active.png)`
-
-#### Deep-Dive Technical Insights (PAN-OS Packet Flow):
-* **Inbound DNAT Evaluation (`DNAT-Web-80`):** In Rule 1, both the `SOURCE ZONE` and `DESTINATION ZONE` in the Original Packet specification are configured as **`Untrust`**. Under PAN-OS packet processing, when a packet arrives on `ethernet1/1` destined for `WEB-PUBLIC` (`192.0.2.10`), the firewall performs an initial route lookup prior to NAT translation. Since `192.0.2.10` resides on an untrusted edge interface, the initial destination zone is evaluated as `Untrust`. After matching `DNAT-Web-80`, the destination IP is translated to `WEB-DMZ` (`10.10.100.10:80`). Subsequent route evaluation then vectors the translated packet to the `DMZ` zone.
-* **Dynamic Egress-Bound SNAT (`SNAT-via-ISP1` & `SNAT-via-ISP2`):** Rules 2 and 3 govern outbound internet access for internal zones (`DMZ`, `Trust`) with `dynamic-ip-and-port` translation. Crucially, they differentiate traffic using **`DESTINATION INTERFACE`** (`ethernet1/1` for ISP1 and `ethernet1/2` for ISP2).
-  * **Hit Count Proof:** During primary path operation, `SNAT-via-ISP1` recorded **34 hits**, while `SNAT-via-ISP2` remained at **0 hits**. When a failover event occurs, the FIB automatically updates the egress interface, steering packets to `SNAT-via-ISP2` without requiring any manual policy updates.
+* `SPG-Strict` combines Anti-Spyware (strict), Vulnerability Protection (strict), URL Filtering (default), and File Blocking (strict).
+* *Limitation:* The PA-VM in this lab lacks a Threat Prevention license, meaning signature-based IPS was configured but bypassed at the dataplane. L3/L4 controls (routing, NAT, App-ID rules, Zone Protection) were fully validated.
 
 ---
 
-### 5.2. Layered Security Policy Ruleset (Least-Privilege Enforcement)
+## 6. Policy and NAT Functional Verification
 
-![Figure 19: Enterprise Security Policy Ruleset Implementing App-ID and Least Privilege](./images/19_paloalto_security_policy_ruleset.png)
-*Markdown Embed Code:* `![Figure 19 - Security Policy Ruleset](./images/19_paloalto_security_policy_ruleset.png)`
+### 6.1 IT to DMZ (Allowed)
+![Figure 24 - Traffic log, IT host to DMZ](./images/21_paloalto_traffic_log_detailed_it_to_dmz.png)
+* Application `ping`, action `allow`, rule `IT-to-DMZ-Admin`. Source 10.10.10.2 (Trust) to 10.10.100.10 (DMZ).
 
-#### Engineering Insights:
-1. `IT-to-DMZ-Admin`: Restricts administration to `NET-IT` sources within the `Trust` zone, allowing only explicitly verified management applications (`ping`, `ssh`, `ssl`, `web-browsing`) over standard application ports (`application-default`).
-2. `HR-to-DMZ-Web` & `HR-to-DMZ-Deny`: The Human Resources department (`NET-HR`) is restricted to standard web services (`dns`, `ssl`, `web-browsing`). All administrative protocols, including ICMP ping, are explicitly rejected by rule 3 (`HR-to-DMZ-Deny`, `Action: Deny`).
-3. `Trust-to-Internet`: Permits corporate users outbound internet connectivity across verified business applications.
-4. `Internet-to-Web`: Illustrates the foundational PAN-OS security rule principle: **"Pre-NAT Destination Address with Post-NAT Destination Zone"**. Destination Address references the external VIP (`WEB-PUBLIC`), while Destination Zone specifies the post-translation zone (`DMZ`), restricting inbound traffic to `ssl` and `web-browsing`.
-5. `DMZ-to-Trust-Deny`: Blocks all inbound connections initiated from the `DMZ` toward internal subnets (`Trust`). If an external web server is compromised, the attacker cannot pivot into the corporate intranet.
-6. `Cleanup`: Acts as an explicit deny-all rule to log all unauthorized connection attempts.
+### 6.2 Outbound Internet with Source NAT
+![Figure 25 - Traffic log, Trust to Internet with SNAT via ISP1](./images/22_paloalto_traffic_log_detailed_trust_to_internet_snat.png)
+* Application `ping`, rule `Trust-to-Internet`, destination 8.8.8.8. Source 10.10.10.2 is translated to 198.51.100.2, confirming `SNAT-via-ISP1`.
 
----
+### 6.3 HR to DMZ (Denied)
+![Figure 26 - Traffic log, HR to DMZ denied](./images/23_paloalto_traffic_log_detailed_hr_to_dmz_deny.png)
+* Action `deny`, rule `HR-to-DMZ-Deny`. Source 10.10.20.2 (Trust) to 10.10.100.10 (DMZ) blocked.
 
-### 5.3. Layer 7 Threat Profile Integration & Licensing Architecture
+### 6.4 DMZ to Trust (Denied)
+![Figure 27 - Traffic log, DMZ to Trust denied](./images/24_paloalto_traffic_log_detailed_dmz_to_trust_deny.png)
+* Action `deny`, rule `DMZ-to-Trust-Deny`. Source 10.10.100.10 (DMZ) to 10.10.20.2 (Trust) blocked.
 
-![Figure 20: Security Profile Group SPG-Strict Combining L7 Deep Packet Inspection](./images/20_paloalto_security_profile_groups_strict.png)
-*Markdown Embed Code:* `![Figure 20 - Security Profile Group SPG-Strict](./images/20_paloalto_security_profile_groups_strict.png)`
-
-![Figure 20a: Vulnerability Protection Profile Strict Ruleset Configuration](./images/image_c96219.png)
-*Markdown Embed Code:* `![Figure 20a - Vulnerability Protection Profile Strict Rules](./images/image_c96219.png)`
-
-![Figure 20b: Binding Security Profile Groups and Session Logging on Security Policy Rules](./images/image_c962b2.png)
-*Markdown Embed Code:* `![Figure 20b - Security Policy Rule Actions and Profile Attachment](./images/image_c962b2.png)`
-
-#### Engineering Insights:
-* The `SPG-Strict` profile group bundles four inspection engines: `Anti-Spyware: strict`, `Vulnerability Protection: strict`, `URL Filtering: default`, and `File Blocking: strict file blocking`.
-* Under the `strict` profile, attacks categorized under `critical`, `high`, and `medium` severity for both client and server traffic are configured to **`reset-both`**, terminating connections at both endpoints.
-* **Architectural Note on PAN-OS Licensing:** In evaluation environments without an active Threat Prevention license (`vm-license: none`), the dataplane bypasses L7 signature matching to preserve throughput. L3/L4 enforcement, dynamic routing, NAT, App-ID, and Zone Protection function fully at line rate regardless of licensing status.
+### 6.5 Destination NAT
+![Figure 28 - Traffic log, inbound DNAT to the web server](./images/25_paloalto_traffic_log_detailed_dnat_internet_to_web.png)
+* Application `web-browsing`, action `allow`, rule `Internet-to-Web`. Original: 198.51.100.1 to 192.0.2.10:80. Translated destination: 10.10.100.10:80 (DMZ).
 
 ---
 
-## 6. Security Policy & NAT Functional Verification
+## 7. WAN Failover and Failback
 
-### 6.1. IT Department DMZ Administrative Access Verification
+### 7.1 BGP Events
+![Figure 29 - System log showing BGP peer leaving and re-entering Established](./images/27_paloalto_system_log_bgp_failover_established.png)
+* Administratively downing the ISP1 link produced `routed-BGP-peer-left-established` (at 03:05:37 and 03:10:52). Following link restoration, the session returned to Established within approximately 10 seconds.
 
-![Figure 21: Detailed Traffic Log Confirming Authorized ICMP Access from IT to DMZ](./images/21_paloalto_traffic_log_detailed_it_to_dmz.png)
-*Markdown Embed Code:* `![Figure 21 - Traffic Log IT to DMZ Allow](./images/21_paloalto_traffic_log_detailed_it_to_dmz.png)`
+### 7.2 Traffic Behavior
+![Figure 30 - Traffic log of a continuous ping during the failover test](./images/28_paloalto_traffic_log_continuous_ping_failover_test.png)  
+![Figure 31 - During failover, sessions leave via ISP2](./images/30_paloalto_traffic_log_failover_active_isp2.png)  
+![Figure 32 - After recovery, sessions return to ISP1](./images/31_paloalto_traffic_log_failback_restored_isp1.png)
 
-#### Verification Results:
-* **Session ID:** 62 | **Application:** `ping` | **Action:** `allow` (`Action Source: from-policy`)
-* **Source:** `10.10.10.2` (`NET-IT`, `Zone: Trust`, `Interface: ethernet1/4`)
-* **Destination:** `10.10.100.10` (`WEB-DMZ`, `Zone: DMZ`, `Interface: ethernet1/3`)
-* **Analysis:** Verifies authorized inter-zone access per the `IT-to-DMZ-Admin` security policy.
-
----
-
-### 6.2. Corporate Internet Outbound Access & Dynamic SNAT Verification
-
-![Figure 22: Detailed Traffic Log Confirming Outbound Internet Access and SNAT via ISP1](./images/22_paloalto_traffic_log_detailed_trust_to_internet_snat.png)
-*Markdown Embed Code:* `![Figure 22 - Traffic Log Trust to Internet SNAT ISP1](./images/22_paloalto_traffic_log_detailed_trust_to_internet_snat.png)`
-
-#### Verification Results:
-* **Session ID:** 140 | **Application:** `ping` | **Action:** `allow` per `Trust-to-Internet`
-* **Source:** `10.10.10.2` translated to **`NAT IP: 198.51.100.2`** (Interface `ethernet1/1`)
-* **Destination:** `8.8.8.8` (`Zone: Untrust`, `Port: 0`)
-* **Analysis:** Confirms that outbound enterprise traffic correctly matches `SNAT-via-ISP1`, translating internal private IPs to the primary public WAN IP.
+* **Failover:** While ISP1 was down, outbound sessions dynamically routed via `ethernet1/2` and translated to `198.51.200.2`, confirming `SNAT-via-ISP2` engages without manual intervention.
+* **Failback:** Once ISP1 recovered, its higher local preference restored it as the active exit; sessions returned to `ethernet1/1` utilizing NAT address `198.51.100.2`.
+* **Measured Loss:** 3 ICMP packets lost out of 100 sent during a continuous ping from the IT host to 8.8.8.8 (average ~3 seconds convergence).
 
 ---
 
-### 6.3. Inter-VLAN Micro-segmentation: HR DMZ Isolation
+## 8. Perimeter Defense: Reconnaissance and SYN Flood
 
-![Figure 23: Detailed Traffic Log Demonstrating Immediate Denial of HR-to-DMZ Traffic](./images/23_paloalto_traffic_log_detailed_hr_to_dmz_deny.png)
-*Markdown Embed Code:* `![Figure 23 - Traffic Log HR to DMZ Deny](./images/23_paloalto_traffic_log_detailed_hr_to_dmz_deny.png)`
+### 8.1 Attack Simulation (Kali Linux)
+![Figure 33 - Kali route table for reaching the target network](./images/image_c88802.png)  
+![Figure 34 - nmap scan against 192.0.2.10](./images/image_c88f86.png)  
+![Figure 35 - hping3 SYN flood](./images/image_c8f1f8.png)
 
-#### Verification Results:
-* **Session ID:** 0 | **Application:** `ping` | **Action:** `deny` (`TYPE: drop`)
-* **Policy Matched:** `HR-to-DMZ-Deny` | **Session End Reason:** `policy-deny`
-* **Source:** `10.10.20.2` (`NET-HR`, `Zone: Trust`) $\rightarrow$ **Destination:** `10.10.100.10` (`Zone: DMZ`)
-* **Analysis:** Confirms that unauthorized lateral network movement from non-technical workstations is dropped at the ingress stage (`Session ID: 0`, `0 bytes`).
+* The attacker (172.16.0.2) targeted the public VIP 192.0.2.10.
+* A standard `nmap -sS` scan was blocked; `nmap -Pn -sS` was utilized to bypass ping probes.
+* Flood execution: `sudo hping3 -S -p 80 --flood 192.0.2.10` pushed ~3.59 million SYN packets.
 
----
+### 8.2 Port-Scan Protection
+![Figure 36 - Threat log, TCP port scan dropped](./images/32_paloalto_threat_log_zone_protection_tcp_port_scan_drop.png)
+* At 03:54:38, the firewall logged the scan as type `scan`, severity `medium`, action `drop`.
+* **Session ID is 0** and the Rule column is blank, demonstrating that the Zone Protection profile mitigates the threat at the ingress stage before session allocation or policy lookup.
 
-### 6.4. Reverse Pivot Prevention: DMZ-to-Trust Isolation
-
-![Figure 24: Detailed Traffic Log Demonstrating Complete Isolation of DMZ-to-Trust Traffic](./images/24_paloalto_traffic_log_detailed_dmz_to_trust_deny.png)
-*Markdown Embed Code:* `![Figure 24 - Traffic Log DMZ to Trust Deny](./images/24_paloalto_traffic_log_detailed_dmz_to_trust_deny.png)`
-
-#### Verification Results:
-* **Session ID:** 0 | **Application:** `ping` | **Action:** `deny` (`TYPE: drop`)
-* **Policy Matched:** `DMZ-to-Trust-Deny` | **Session End Reason:** `policy-deny`
-* **Source:** `10.10.100.10` (`Zone: DMZ`) $\rightarrow$ **Destination:** `10.10.20.2` (`Zone: Trust`)
-* **Analysis:** Proves the DMZ cannot initiate traffic into the internal network, mitigating pivot risks should an internet-facing host be compromised.
+### 8.3 SYN Flood Protection
+![Figure 37 - Threat log, SYN flood handled by SYN cookies](./images/33_paloalto_threat_log_zone_protection_syn_flood_cookie.png)
+* The flood was identified as type `flood`, severity `critical`, session ID `0`. The Zone Protection profile leverages cryptographic **SYN Cookies**, safeguarding firewall and server resources from TCP backlog exhaustion.
 
 ---
 
-### 6.5. Inbound Destination NAT Publication Verification
-
-![Figure 25: Detailed Traffic Log Confirming Inbound DNAT and Web Service Delivery](./images/25_paloalto_traffic_log_detailed_dnat_internet_to_web.png)
-*Markdown Embed Code:* `![Figure 25 - Traffic Log Inbound DNAT Internet to Web](./images/25_paloalto_traffic_log_detailed_dnat_internet_to_web.png)`
-
-#### Verification Results:
-* **Session ID:** 570 | **Application:** `web-browsing` | **Action:** `allow` via `Internet-to-Web`
-* **Original Packet:** Source `198.51.100.1:53233` $\rightarrow$ Destination **`192.0.2.10:80`** (`Untrust`, `ethernet1/1`)
-* **Translated Packet:** Destination translated to **`10.10.100.10:80`** (`DMZ`, `ethernet1/3`)
-* **Analysis:** Validates that external HTTP clients successfully access the internal DMZ web server through the public virtual IP address.
+## 9. Limitations
+* **Virtual Environment:** Executed entirely in EVE-NG; throughput, scale, or hardware-specific production behaviors are not claimed.
+* **Inter-VLAN Routing:** VLANs 10, 20, and 30 are routed at the core layer. Firewall policy enforcement operates strictly at the macro-zone level (Trust / DMZ / Untrust), not laterally between campus VLANs.
+* **Single Firewall:** Hardware constraints prevented deploying an HA pair (Active/Passive); link and path monitoring were studied conceptually.
+* **Licensing:** Without an active Threat Prevention license, L7 signature IPS functions were bypassed at the dataplane.
+* **Simulated Internet Routing:** The public VIP is advertised as a /32 host route. Production ISPs typically drop prefixes longer than /24.
 
 ---
 
-## 7. High Availability & Convergence: BGP Failover & Failback
+## 10. Issues Encountered and Resolutions
 
-### 7.1. BGP Dynamic Routing State Machine Convergence Logs
-
-![Figure 27: System Event Log Sequence Demonstrating BGP Carrier Link Withdrawal and Recovery](./images/27_paloalto_system_log_bgp_failover_established.png)
-*Markdown Embed Code:* `![Figure 27 - System Log BGP Failover Events](./images/27_paloalto_system_log_bgp_failover_established.png)`
-
-#### State Machine Analysis:
-The PAN-OS `System Logs` (`TYPE: routing`) confirm rapid link failure detection and re-convergence:
-1. **Link Severance:** At `03:05:37` and `03:10:52`, administrative downing of the primary `ISP1` link triggered a high-severity alert: `routed-BGP-peer-left-established` (peer `198.51.100.1`). The BGP engine withdrew the primary default route and shifted traffic to `ISP2-R2` in **sub-second time**.
-2. **Path Re-establishment:** Upon interface recovery at `03:05:47` and `03:10:57`, the BGP control plane initiated capabilities exchange (`routed-BGP-peer-mp-extension-negotiate` for `AFI/SAFI 1/1`) and transitioned back to `routed-BGP-peer-enter-established` within seconds.
-
----
-
-### 7.2. Traffic Continuity & Dynamic SNAT Rerouting (Failover vs. Failback)
-
-![Figure 28: Continuous Traffic Stream Demonstrating Uninterrupted Outbound Connectivity During Failover](./images/28_paloalto_traffic_log_continuous_ping_failover_test.png)
-*Markdown Embed Code:* `![Figure 28 - Continuous Ping Traffic Log During Failover](./images/28_paloalto_traffic_log_continuous_ping_failover_test.png)`
-
-![Figure 30: Detailed Traffic Log Demonstrating Dynamic SNAT Rerouting via ISP2 During Failover](./images/30_paloalto_traffic_log_failover_active_isp2.png)
-*Markdown Embed Code:* `![Figure 30 - Traffic Log Failover Active on ISP2](./images/30_paloalto_traffic_log_failover_active_isp2.png)`
-
-![Figure 31: Detailed Traffic Log Confirming Automatic Failback and SNAT Restoration via ISP1](./images/31_paloalto_traffic_log_failback_restored_isp1.png)
-*Markdown Embed Code:* `![Figure 31 - Traffic Log Failback Restored on ISP1](./images/31_paloalto_traffic_log_failback_restored_isp1.png)`
-
-#### End-to-End Validation Summary:
-* **Service Continuity:** As shown in Figure 28, continuous outbound ICMP streams from `10.10.10.2` to `8.8.8.8` remained active across failure transitions (`03:06:17`, `03:07:17`, `03:10:07`, `03:10:22`, `03:10:42`).
-* **Automated Failover (Figure 30, Session 167):** When the primary link failed, traffic seamlessly rerouted out `Interface: ethernet1/2` and translated to **`NAT IP: 198.51.200.2`** (ISP2), confirming dynamic NAT policy realignment driven by routing table updates.
-* **Automated Failback (Figure 31, Session 162):** When ISP1 recovered, its higher Local Preference restored it as the active path. Outbound sessions shifted back to `Interface: ethernet1/1` and translated to **`NAT IP: 198.51.100.2`** (ISP1) without administrative intervention.
+| Issue | Cause | Resolution |
+| :--- | :--- | :--- |
+| ISP did not see 192.0.2.0/24 | Loopback addresses are installed as /32 on PAN-OS, so the /24 redistribution rule matched nothing. | Advertised the /32 host route instead. |
+| Commit failed: "Failed to add route 192.0.2.0/24 in export rule... same static route is configured to discard" | A static discard route for the same prefix conflicted with BGP export logic. | Removed the static discard route. |
+| Warnings: BGP import/export policy "not used by any peer-group" | Rules were created but not actively bound to a peer group. | Bound each rule to its respective peer group via *Used By*. |
+| Ping to 192.0.2.10 got no reply although the traffic log showed allow | Replies to the firewall's own loopback require a management profile permitting ICMP. | Applied the `ALLOW-PING` management profile to the loopback. |
+| `test nat-policy-match` returned No-NAT; `show running nat-policy` lacked a translate-to line | The DNAT rule possessed match conditions but the Translated Packet configuration was empty. | Set Destination Address Translation to Static IP `WEB-DMZ`, port 80/443. |
+| Commit failed: "Mismatch of destination address translation range" on `SNAT-via-ISP1` | A destination translation was erroneously present on a dynamic source NAT rule. | Retained source translation solely on SNAT rules; destination translation solely on DNAT rules. |
 
 ---
 
-## 8. Perimeter Defense: L3/L4 Reconnaissance & DoS Attack Mitigation
+## 11. Acceptance Matrix
 
-### 8.1. Attack Simulation via Kali Linux (Red Team Perspective)
-
-![Figure 32a: Kali Linux Route Table Provisioning for Target Network Reachability](./images/image_c88802.png)
-*Markdown Embed Code:* `![Figure 32a - Kali Linux Nmap Route Verification](./images/image_c88802.png)`
-
-![Figure 32b: Nmap Reconnaissance Probes Blocked by Firewall Stealth Baseline](./images/image_c88f86.png)
-*Markdown Embed Code:* `![Figure 32b - Kali Linux Nmap Ping Probe Blocked](./images/image_c88f86.png)`
-
-![Figure 32c: High-Volume TCP SYN Flood Attack Executed via hping3](./images/image_c8f1f8.png)
-*Markdown Embed Code:* `![Figure 32c - Kali Linux hping3 SYN Flood Execution](./images/image_c8f1f8.png)`
-
-#### Attack Execution Walkthrough:
-* **Reconnaissance Testing:** The attacker node (`172.16.0.2` behind ISP1) targeted public IP `192.0.2.10`. An initial sweep using `nmap -sS` was thwarted by default probe suppression (`Host seems down... try -Pn`), verifying the firewall drops unsolicited ICMP discovery traffic. Bypassing host discovery with `sudo nmap -Pn -sS -p 21,22,23,25,53,80,443,444,445... 192.0.2.10` launched a concurrent port scan across exposed services.
-* **Denial of Service (DoS) Attack:** To test state exhaustion defenses, `hping3` was deployed:
-  ```bash
-  sudo hping3 -S -p 80 --flood 192.0.2.10
-  ```
-  The attack flooded the target with **3,594,555 TCP SYN packets** (`40 headers + 0 data bytes`) to exhaust state resources.
-
----
-
-### 8.2. Reconnaissance Protection: High-Rate TCP Port Scan Mitigation
-
-![Figure 32: Threat Log Demonstrating Hardware-Level Ingress Drop of Nmap Port Scan Probes](./images/32_paloalto_threat_log_zone_protection_tcp_port_scan_drop.png)
-*Markdown Embed Code:* `![Figure 32 - Threat Log TCP Port Scan Drop](./images/32_paloalto_threat_log_zone_protection_tcp_port_scan_drop.png)`
-
-#### Key Defense Insights for Technical Interviewers:
-* **Threat Classification:** At `03:54:38`, the firewall flagged the scan from `Source: 172.16.0.2` on `Interface: ethernet1/1` as **`TYPE: scan`**, assigned **`SEVERITY: medium`**, and applied **`Action: drop`**.
-* **Pre-Session Mitigation Architecture:**
-  * **`Session ID: 0`:** The probe packets were dropped at the hardware ingress stage before session creation, preventing session table consumption.
-  * **`Rule: Blank`:** The packets were dropped by the **Zone Protection Profile** prior to security policy evaluation, conserving CPU cycles during high-rate scans.
-
----
-
-### 8.3. DoS Flood Mitigation: SYN Cookies Defense Mechanism
-
-![Figure 33: Threat Log Confirming SYN Cookie Proxy Activation Under Heavy Flood Attack](./images/33_paloalto_threat_log_zone_protection_syn_flood_cookie.png)
-*Markdown Embed Code:* `![Figure 33 - Threat Log SYN Flood Cookie Mitigation](./images/33_paloalto_threat_log_zone_protection_syn_flood_cookie.png)`
-
-#### Detailed Defense Mechanics:
-* **Threat Classification:** When inundated by over 3.59 million SYN packets, the firewall raised a critical alert: **`TYPE: flood`**, **`SEVERITY: critical`** (`Protocol: tcp`, `Zone: Untrust`).
-* **SYN Cookie Proxy (`Action: allow`, `Session ID: 0`):**
-  * When the SYN rate exceeds the profile's `Activate Rate`, the firewall activates **SYN Cookie mode**.
-  * Instead of allocating memory for half-open connections, the firewall responds with a cryptographic challenge encoded in the TCP Sequence Number (`Action: allow` indicates the challenge packet was transmitted; `Session ID: 0` confirms no session was allocated).
-  * Only clients that return a valid `ACK` completing the 3-way handshake are allocated a state table entry and forwarded to the DMZ web server. This protects both the firewall and backend servers from connection table exhaustion.
-
----
-
-## 9. PoC Acceptance & Validation Matrix
-
-| Test ID | Technical Validation Objective | Test Methodology & Execution | Empirical Results & Verified Artifacts |
+| Test ID | Objective | Method | Result |
 | :--- | :--- | :--- | :--- |
-| **TC-01** | OSPFv2 Interior Routing & DMZ Hardening | Configured OSPF `0.0.0.0` with `Link Type: p2p`, enabled `Passive` on DMZ, verified neighbors. | Reached `STATUS: full` with dual core switches (`10.255.255.2`, `10.255.255.3`). Injected `0.0.0.0/0` via external type `ext-2`. |
-| **TC-02** | Dual-ISP eBGP Peering & Route Filtering | Configured eBGP (`AS 65000`) with ISP1 (`AS 65001`) and ISP2 (`AS 65002`); enforced prefix limits and export whitelisting. | Both peers reached `STATUS: Established`. Successfully advertised `192.0.2.0/24(exact)` while blocking internal RFC 1918 routes. |
-| **TC-03** | Zero Trust Inter-Zone Policy & NAT/PAT | Tested connectivity across `NET-IT`, `NET-HR`, `DMZ`, and external internet hosts (`8.8.8.8`). | Authorized IT access to DMZ (`Session ID: 62`); blocked HR access (`HR-to-DMZ-Deny`); prevented DMZ reverse traversal (`DMZ-to-Trust-Deny`); verified DNAT to `10.10.100.10:80`. |
-| **TC-04** | Sub-Second BGP Failover & Automatic Failback | Severed primary ISP1 link during active traffic (`ping 8.8.8.8`), monitored convergence, and restored the link. | Outbound sessions dynamically failed over to ISP2 (`ethernet1/2`, `NAT IP: 198.51.200.2`), then automatically failed back to ISP1 (`ethernet1/1`, `NAT IP: 198.51.100.2`). |
-| **TC-05** | L3/L4 Perimeter Defense & DoS Mitigation | Ran `nmap -Pn -sS` port scans and launched `3,594,555` SYN flood packets using `hping3` from Kali Linux. | Dropped scan probes at ingress (`TYPE: scan`, `Action: drop`, `Session ID: 0`). Mitigated flood attack via SYN Cookies (`TYPE: flood`, `Severity: critical`, `Session ID: 0`). |
+| **TC-01** | OSPF with both cores, default route injection | OSPF Area 0, p2p links, passive DMZ, RP-BGP-DEF exported as ext-2. | Full adjacency with 10.255.255.2 and 10.255.255.3. |
+| **TC-02** | Dual-ISP eBGP and export filtering | eBGP to AS 65001 and AS 65002, max-prefix, export whitelist. | Both peers Established; external routing table cleanly filtered. |
+| **TC-03** | Zone policy and NAT | IT/HR to DMZ, Trust to Internet, Internet to web VIP. | IT allowed; HR denied; DMZ lateral movement denied; DNAT successful to 10.10.100.10:80. |
+| **TC-04** | ISP failover and failback | Dropped ISP1 link during continuous ping, subsequently restored. | Sessions dynamically moved to `ethernet1/2` (198.51.200.2) and back to `ethernet1/1` (198.51.100.2); negligible packet loss. |
+| **TC-05** | Recon and SYN flood protection | `nmap -Pn -sS` and `hping3 --flood` from Kali Linux. | Scan dropped pre-session (scan, drop, session 0); flood mitigated via SYN cookies (flood, critical, session 0). |
 
 ---
 
-## 10. Key Engineering Takeaways & Professional Competencies
-
-1. **Production-Ready Routing Architecture:** Combines exterior eBGP multihoming with interior OSPFv2, managing route redistribution and filtering to ensure resilient network reachability.
-2. **PAN-OS Flow Logic Mastery:** Successfully deploys Pre-NAT address definitions alongside Post-NAT zone constructs, coordinating dynamic NAT with routing table updates across multiple WAN interfaces.
-3. **Defense-in-Depth Engineering:** Implements layered controls that combine Zero Trust inter-zone policies with ingress Zone Protection profiles, dropping malicious traffic early to safeguard system resources.
+## 12. Skills Demonstrated
+* **Routing Architecture:** Dual-homed eBGP edge combined with internal OSPFv2, featuring controlled redistribution and rigorous export filtering.
+* **PAN-OS Packet-Flow Logic:** Mastery of pre-NAT address and post-NAT zone evaluations, per-egress-interface SNAT, and CLI diagnostics (`test nat-policy-match`, `show running nat-policy`).
+* **Zero Trust Policy:** Implementation of zone-based least-privilege App-ID rules and hardware-optimized ingress protection using Zone Protection profiles.
+* **Methodical Execution:** Structured deployment, disciplined naming conventions (Object-Oriented Policy Management), and systematic troubleshooting documentation.
