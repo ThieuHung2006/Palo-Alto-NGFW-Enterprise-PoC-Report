@@ -137,7 +137,6 @@ Paths: (1 available, best #1, table default)
 
 ### 5.1 NAT Policy
 
-![Figure 18 - NAT policy (DNAT and per-ISP SNAT)](./images/18_paloalto_nat_policy_dnat_snat_rules.png)  
 ![Figure 19 - NAT rule hit counts with ISP1 active](./images/26_paloalto_nat_policy_hit_count_isp1_active.png)
 
 * **DNAT (`DNAT-Web-80`):** Source and destination zones are both `Untrust` in the Original Packet, matching the pre-NAT destination (`WEB-PUBLIC`). The destination is translated (Static IP) to `WEB-DMZ` on port 80, and the post-NAT route lookup places the packet in the `DMZ`.
