@@ -1,0 +1,40 @@
+enable
+configure terminal
+hostname ISP-R1
+no ip domain-lookup
+
+interface Loopback0
+ description Simulated_Internet_DNS
+ ip address 8.8.8.8 255.255.255.255
+exit
+
+interface Ethernet0/0
+ description Link_to_ISP-R2
+ ip address 203.0.113.1 255.255.255.252
+ no shutdown
+exit
+
+interface Ethernet0/1
+ description Link_to_PaloAlto1_eth1/1
+ ip address 198.51.100.1 255.255.255.252
+ no shutdown
+exit
+
+router bgp 65001
+ bgp router-id 8.8.8.8
+ bgp log-neighbor-changes
+ neighbor 203.0.113.2 remote-as 65002
+ neighbor 203.0.113.2 description Peer_to_ISP-R2
+ neighbor 198.51.100.2 remote-as 65000
+ neighbor 198.51.100.2 description Peer_to_PaloAlto
+ network 8.8.8.8 mask 255.255.255.255
+ address-family ipv4
+  neighbor 203.0.113.2 activate
+  neighbor 198.51.100.2 activate
+  neighbor 198.51.100.2 default-originate
+  neighbor 198.51.100.2 soft-reconfiguration inbound
+ exit-address-family
+exit
+
+end
+write memory

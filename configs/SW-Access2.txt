@@ -1,0 +1,32 @@
+enable
+configure terminal
+hostname SW-Access2
+
+vlan 20
+ name HR-Dept
+vlan 999
+ name Native-Drop
+exit
+
+spanning-tree mode rapid-pvst
+
+interface range Ethernet0/1 - 2
+ switchport trunk encapsulation dot1q
+ switchport mode trunk
+ switchport trunk native vlan 999
+ switchport nonegotiate
+ switchport trunk allowed vlan 20
+ no shutdown
+exit
+
+interface Ethernet0/0
+ description Connect_to_VPC2
+ switchport mode access
+ switchport access vlan 20
+ spanning-tree portfast
+ spanning-tree bpduguard enable
+ no shutdown
+exit
+
+end
+write memory

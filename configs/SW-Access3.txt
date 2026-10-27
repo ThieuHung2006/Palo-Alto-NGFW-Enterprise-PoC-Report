@@ -1,0 +1,32 @@
+enable
+configure terminal
+hostname SW-Access3
+
+vlan 30
+ name Server-Farm
+vlan 999
+ name Native-Drop
+exit
+
+spanning-tree mode rapid-pvst
+
+interface range Ethernet0/1 - 2
+ switchport trunk encapsulation dot1q
+ switchport mode trunk
+ switchport trunk native vlan 999
+ switchport nonegotiate
+ switchport trunk allowed vlan 30
+ no shutdown
+exit
+
+interface Ethernet0/0
+ description Connect_to_VPC3
+ switchport mode access
+ switchport access vlan 30
+ spanning-tree portfast
+ spanning-tree bpduguard enable
+ no shutdown
+exit
+
+end
+write memory

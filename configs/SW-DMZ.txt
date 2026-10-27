@@ -1,0 +1,19 @@
+enable
+configure terminal
+hostname SW-DMZ
+
+vlan 100
+ name DMZ-Servers
+exit
+
+spanning-tree mode rapid-pvst
+
+interface range Ethernet0/0 - 2
+ switchport mode access
+ switchport access vlan 100
+ spanning-tree portfast
+ no shutdown
+exit
+
+end
+write memory
