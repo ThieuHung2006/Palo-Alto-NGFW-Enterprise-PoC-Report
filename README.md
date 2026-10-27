@@ -207,9 +207,6 @@ Paths: (1 available, best #1, table default)
 ## 8. Perimeter Defense: Reconnaissance and SYN Flood
 
 ### 8.1 Attack Simulation (Kali Linux)
-![Figure 33 - Kali route table for reaching the target network](./images/image_c88802.png)  
-![Figure 34 - nmap scan against 192.0.2.10](./images/image_c88f86.png)  
-![Figure 35 - hping3 SYN flood](./images/image_c8f1f8.png)
 
 * The attacker (172.16.0.2) targeted the public VIP 192.0.2.10.
 * A standard `nmap -sS` scan was blocked; `nmap -Pn -sS` was utilized to bypass ping probes.
