@@ -157,8 +157,6 @@ Paths: (1 available, best #1, table default)
 ### 5.3 Security Profiles
 
 ![Figure 21 - Security profile group SPG-Strict](./images/20_paloalto_security_profile_groups_strict.png)  
-![Figure 22 - Vulnerability Protection profile (strict)](./images/image_c96219.png)  
-![Figure 23 - Profile group and log settings bound to security rules](./images/image_c962b2.png)
 
 * `SPG-Strict` combines Anti-Spyware (strict), Vulnerability Protection (strict), URL Filtering (default), and File Blocking (strict).
 * *Limitation:* The PA-VM in this lab lacks a Threat Prevention license, meaning signature-based IPS was configured but bypassed at the dataplane. L3/L4 controls (routing, NAT, App-ID rules, Zone Protection) were fully validated.
